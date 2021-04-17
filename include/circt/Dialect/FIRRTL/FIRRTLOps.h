@@ -64,6 +64,10 @@ bool isBundleType(Type type);
 /// connect.
 bool isDuplexValue(Value val);
 
+enum Flow { Source, Sink, Duplex };
+
+Flow getFlow(Value a, bool flip = false);
+
 } // namespace firrtl
 } // namespace circt
 

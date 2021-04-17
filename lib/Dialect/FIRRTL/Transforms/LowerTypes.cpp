@@ -468,7 +468,7 @@ void TypeLoweringVisitor::visitDecl(MemOp op) {
         // lowering target, and then connecting every new port
         // subfield to that.
         if (oldName == "clk" || oldName == "en" || oldName == "addr") {
-          FIRRTLType theType = FlipType::get(elt.type);
+          FIRRTLType theType = elt.type;
 
           // Construct a new wire if needed.
           auto wireName =
@@ -503,10 +503,7 @@ void TypeLoweringVisitor::visitDecl(MemOp op) {
         // Data ports ("data", "mask") are trivially lowered because
         // each data leaf winds up in a new, separate memory. No wire
         // creation is needed.
-        FIRRTLType theType = elt.type;
-        if (kind == MemOp::PortKind::Write)
-          theType = FlipType::get(theType);
-
+        FIRRTLType theType = elt.type.getPassiveType();
         setBundleLowering(op.getResult(j), (oldName + field.suffix).str(),
                           builder->create<SubfieldOp>(
                               theType, newMem.getResult(i), elt.name));
@@ -741,6 +738,10 @@ void TypeLoweringVisitor::visitStmt(ConnectOp op) {
   FIRRTLType destType = getCanonicalAggregateType(dest.getType());
   FIRRTLType srcType = getCanonicalAggregateType(src.getType());
 
+  llvm::errs() << "lowering connect: " << op << "\n"
+               << "  destType: " << destType << "\n"
+               << "  srcType: " << srcType << "\n";
+
   // If we aren't connecting two bundles, there is nothing to do.
   if (!destType || !srcType)
     return;
@@ -763,17 +764,48 @@ void TypeLoweringVisitor::visitStmt(ConnectOp op) {
     Value newDest = std::get<0>(tuple);
     Value newSrc = std::get<1>(tuple);
 
-    // When two bundles are bulk connected, the connect operation becomes a
-    // pair-wise connect of each field. The rules for flow state that a value
-    // from a duplex expression can be used as both a source and sink,
-    // regardless of the flip orientation of the type. To make this work, we
-    // find the non-duplex value and make sure that it is the in the correct
-    // position. Two duplex values cannot be connected, since it is unclear
-    // which side is left or right.
-    if (isDestDuplex ? newSrc.getType().isa<FlipType>()
-                     : !newDest.getType().isa<FlipType>()) {
+    // llvm::errs() << "  new:\n"
+    //              << "    - dest: " << newDest << "\n"
+    //              << "    - src:  " << src << "\n";
+
+    Flow destFlow = getFlow(newDest, newDest.getType().isa<FlipType>());
+
+    auto flowToString = [](Flow a) {
+      switch (a) {
+      case Source:
+        return std::string("source");
+      case Sink:
+        return std::string("sink");
+      case Duplex:
+        return std::string("duplex");
+      }
+    };
+
+    llvm::errs() << "  - destFlow: " << flowToString(destFlow) << "\n";
+
+    switch(destFlow) {
+    case Source:
       std::swap(newSrc, newDest);
+      break;
+    case Sink:
+      break;
+    case Duplex:
+      if (newSrc.getType().isa<FlipType>())
+        std::swap(newSrc, newDest);
+      break;
     }
+
+    // // When two bundles are bulk connected, the connect operation becomes a
+    // // pair-wise connect of each field. The rules for flow state that a value
+    // // from a duplex expression can be used as both a source and sink,
+    // // regardless of the flip orientation of the type. To make this work, we
+    // // find the non-duplex value and make sure that it is the in the correct
+    // // position. Two duplex values cannot be connected, since it is unclear
+    // // which side is left or right.
+    // if (isDestDuplex ? newSrc.getType().isa<FlipType>()
+    //                  : !newDest.getType().isa<FlipType>()) {
+    //   std::swap(newSrc, newDest);
+    // }
 
     builder->create<ConnectOp>(newDest, newSrc);
   }

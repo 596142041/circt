@@ -44,6 +44,43 @@ bool firrtl::isDuplexValue(Value val) {
       .Default([](auto) { return false; });
 }
 
+/// Compute the flow of a value.  This necessarily walks up the
+/// operation definitions to figure it out.
+Flow firrtl::getFlow(Value a, bool flip) {
+
+  bool flipx = flip ^ a.getType().isa<FlipType>();
+
+  // llvm::errs() << "getFlow:\n"
+  //              << "  value: " << a << "\n"
+  //              << "  flip:  " << flip << "\n"
+  //              << "  flipx: " << flipx << "\n";
+  auto propagateFlow = [](Flow flow, bool flipped) {
+    switch (flow) {
+    case Source:
+      return flipped ? Sink : Source;
+    case Sink:
+      return flipped ? Source : Sink;
+    case Duplex:
+      return Duplex;
+    }
+  };
+
+  Operation *op = a.getDefiningOp();
+  if (!op)
+    return flipx ? Sink : Source;
+  return TypeSwitch<Operation *, Flow>(op)
+      .Case<SubfieldOp, SubindexOp, SubaccessOp>(
+          [&](auto op) { return propagateFlow(getFlow(op.input()), flipx); })
+      .Case<RegOp, RegResetOp, WireOp>([](auto) { return Duplex; })
+      .Case<ConstantOp>([](auto) { return Source; })
+      .Case<InvalidValuePrimOp>([](auto) { return Source; })
+      .Default([](auto op) {
+        llvm::errs() << "Don't know how to handle '" << *op << "'\n";
+        llvm_unreachable("Shouldn't be here...");
+        return Source;
+      });
+}
+
 //===----------------------------------------------------------------------===//
 // VERIFY_RESULT_TYPE / VERIFY_RESULT_TYPE_RET
 //===----------------------------------------------------------------------===//
@@ -745,11 +782,12 @@ static LogicalResult verifyMemOp(MemOp mem) {
 
     // Safely search for the "data" field, erroring if it can't be
     // found.
+
     FIRRTLType dataType;
     {
       auto dataTypeOption = portBundleType.getElement("data");
       if (!dataTypeOption && portKind == MemOp::PortKind::ReadWrite)
-        dataTypeOption = portBundleType.getElement("rdata");
+        dataTypeOption = portBundleType.getElement("wdata");
       if (!dataTypeOption) {
         mem.emitOpError() << "has no data field on port " << portName
                           << " (expected to see \"data\" for a read or write "
@@ -757,6 +795,9 @@ static LogicalResult verifyMemOp(MemOp mem) {
         return failure();
       }
       dataType = dataTypeOption.getValue().type;
+      // Read data is expected to have an outer flip, so strip that.
+      if (portKind == MemOp::PortKind::Read)
+        dataType = FlipType::get(dataType);
     }
 
     // Error if the data type isn't passive.
@@ -966,27 +1007,56 @@ static LogicalResult verifyConnectOp(ConnectOp connect) {
            << destWidth << " is not greater than or equal to source width "
            << srcWidth;
 
-  // Check that the LHS is a valid sink and RHS is a valid source.
-  if (isBundleType(destType)) {
-    // For bulk connections, we need to make sure that the connection is
-    // unambiguous by making sure that both sides are not duplex types. TODO: we
-    // are not checking that the connections are recursively well formed when
-    // neither is a duplex type.
-    if (isDuplexValue(connect.dest()) && isDuplexValue(connect.src())) {
-      return connect.emitOpError() << "ambiguous bulk connection between two "
-                                   << "duplex values of bundle type";
+  bool sameType = srcType.getWidthlessType() == destType.getWidthlessType();
+  bool oneFlipped =
+      srcType.getWidthlessType() == FlipType::get(destType.getWidthlessType());
+
+  Flow destFlow = getFlow(connect.dest());
+  Flow srcFlow = getFlow(connect.src());
+
+  auto flowToString = [](Flow a) {
+    switch (a) {
+    case Source:
+      return std::string("source");
+    case Sink:
+      return std::string("sink");
+    case Duplex:
+      return std::string("duplex");
     }
-  } else {
-    // This is a mono-connection. Check that the LHS side is a sink or duplex.
-    // Since we can read from a either a passive or flip type, we don't need to
-    // check anything on the RHS.
-    if (destType.isPassive() && !isDuplexValue(connect.dest())) {
-      return connect.emitOpError("connection destination must be a non-passive "
-                                 "type or a duplex value");
-    }
+  };
+
+  llvm::errs() << "verifying: " << connect << "\n"
+               << "  srcFlow: " << flowToString(srcFlow) << "\n"
+               << "  destFlow: " << flowToString(destFlow) << "\n";
+
+  // The left-hand-side must either be duplex flow or a sink.
+  if (destFlow == Source) {
+    auto diag =
+        connect.emitOpError()
+        << "has incorrect flow for left-hand-side. A Source is used as a Sink.";
+    diag.attachNote(connect.dest().getLoc())
+        << "Expression is used as a Sink but can only be used as a Source.";
+    return diag;
+  }
+
+  // The right-hand-side must be duplex flow, a source, or a passive
+  // sink of a port or an instance.
+  //
+  // TODO: And a kind check here for the sink as source situation.
+  auto srcTypeWithoutOuterFlip = srcType;
+  if (auto a = srcType.dyn_cast<FlipType>())
+    srcTypeWithoutOuterFlip = a.getElementType();
+  if (srcFlow == Sink && !srcTypeWithoutOuterFlip.isPassive()) {
+    auto diag = connect.emitOpError()
+                << "has incorrect flow for right-hand-side. A Sink is used as "
+                   "a Source.";
+    diag.attachNote(connect.src().getLoc())
+        << "Expression is used as a Source but can only be used as a Sink.";
+    return diag;
   }
 
   return success();
+
 }
 
 void WhenOp::createElseRegion() {
@@ -1082,8 +1152,14 @@ FIRRTLType SubfieldOp::getResultType(Type inType, StringAttr fieldName,
                                      Location loc) {
   if (auto bundleType = inType.dyn_cast<BundleType>()) {
     for (auto &elt : bundleType.getElements()) {
-      if (elt.name == fieldName)
+      if (elt.name == fieldName) {
+        // FIRRTL puts flips on element fields, not on the underlying
+        // types.  The result type of a subfield should strip a flip
+        // if one exists.
+        // if (auto flipped = elt.type.dyn_cast<FlipType>())
+        //   return flipped.getElementType().cast<FIRRTLType>();
         return elt.type;
+      }
     }
     mlir::emitError(loc, "unknown field '")
         << fieldName.getValue() << "' in bundle type " << inType;
@@ -1092,7 +1168,7 @@ FIRRTLType SubfieldOp::getResultType(Type inType, StringAttr fieldName,
 
   if (auto flipType = inType.dyn_cast<FlipType>())
     if (auto subType = getResultType(flipType.getElementType(), fieldName, loc))
-      return FlipType::get(subType);
+      return subType;
 
   mlir::emitError(loc, "subfield requires bundle operand");
   return {};
